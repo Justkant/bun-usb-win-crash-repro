@@ -130,6 +130,21 @@ async function run(device) {
   outEp.timeout = 3000;
   inEp.timeout = 3000;
 
+  // Drain any spurious frames left in the IN endpoint buffer (e.g. from a previous
+  // session or from the device responding to SET_INTERFACE). A 100 ms timeout means
+  // "no more data" and we stop. Without this, a stale frame is read as frame 0 with
+  // a garbage totalLen, causing the loop to over-read and time out on frame 4.
+  inEp.timeout = 100;
+  let drained = 0;
+  while (true) {
+    try {
+      await new Promise((res, rej) => inEp.transfer(FRAME_SIZE, (err, buf) => err ? rej(err) : res(buf)));
+      drained++;
+    } catch { break; }
+  }
+  inEp.timeout = 3000;
+  if (drained > 0) console.log(`  drained ${drained} stale frame(s) from IN endpoint`);
+
   // [3] transferOut: send a framed GET_OS_VERSION APDU (0xB001000000)
   // Ledger frame: channel(2) | tag=0x05(1) | seq=0(2) | apduLen(2) | apdu(...)
   console.log("\n[3] Sending GET_OS_VERSION APDU via transferOut...");
