@@ -94,6 +94,16 @@ async function run(device) {
   device.open();
   console.log("  open() OK");
 
+  // setConfiguration(0) unconfigures the device so the subsequent setConfiguration(1)
+  // is never a no-op: it always sends SET_CONFIGURATION to the device, which resets
+  // endpoint data-toggle bits on both sides. Without this, WinUSB skips the request
+  // when config 1 is already active and the device-side toggle stays out of sync,
+  // causing transferIn to time out on every run after the first.
+  try {
+    await new Promise((res, rej) => device.setConfiguration(0, cb(res, rej)));
+    console.log("  setConfiguration(0) OK");
+  } catch (e) { console.log(`  setConfiguration(0) error: ${e?.message ?? e}`); }
+
   await new Promise((res, rej) => device.setConfiguration(1, cb(res, rej)));
   console.log("  setConfiguration(1) OK");
 
@@ -119,15 +129,6 @@ async function run(device) {
   // Guard against infinite hangs if the device stops responding
   outEp.timeout = 3000;
   inEp.timeout = 3000;
-
-  // clearHalt resets the endpoint data-toggle bits and flushes stale endpoint
-  // state left over from a previous session (avoids freeze on second run)
-  console.log("  calling clearHalt()...");
-  try {
-    await new Promise((res, rej) => outEp.clearHalt(cb(res, rej)));
-    await new Promise((res, rej) => inEp.clearHalt(cb(res, rej)));
-    console.log("  clearHalt() OK");
-  } catch (e) { console.log(`  clearHalt() error: ${e?.message ?? e}`); }
 
   // [3] transferOut: send a framed GET_OS_VERSION APDU (0xB001000000)
   // Ledger frame: channel(2) | tag=0x05(1) | seq=0(2) | apduLen(2) | apdu(...)
