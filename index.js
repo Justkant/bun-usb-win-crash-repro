@@ -116,6 +116,19 @@ async function run(device) {
   }
   console.log(`  OUT ep: 0x${outEp.address.toString(16)}  IN ep: 0x${inEp.address.toString(16)}`);
 
+  // Guard against infinite hangs if the device stops responding
+  outEp.timeout = 3000;
+  inEp.timeout = 3000;
+
+  // clearHalt resets the endpoint data-toggle bits and flushes stale endpoint
+  // state left over from a previous session (avoids freeze on second run)
+  console.log("  calling clearHalt()...");
+  try {
+    await new Promise((res, rej) => outEp.clearHalt(cb(res, rej)));
+    await new Promise((res, rej) => inEp.clearHalt(cb(res, rej)));
+    console.log("  clearHalt() OK");
+  } catch (e) { console.log(`  clearHalt() error: ${e?.message ?? e}`); }
+
   // [3] transferOut: send a framed GET_OS_VERSION APDU (0xB001000000)
   // Ledger frame: channel(2) | tag=0x05(1) | seq=0(2) | apduLen(2) | apdu(...)
   console.log("\n[3] Sending GET_OS_VERSION APDU via transferOut...");
