@@ -13,10 +13,16 @@ Mirrors the wallet-cli USB transport layer (`NodeWebUsbApduSender` + `NodeWebUsb
 1. Registers hotplug `attach`/`detach` listeners (calls `unrefHotplugEvents` on exit)
 2. Finds a Ledger device (VID `0x2C97`) via `getDeviceList()`
 3. Creates a `WebUSBDevice` instance and finds the vendor interface (class `0xFF`)
-4. **`setupConnection`**: `open()` → `selectConfiguration(1)` → `reset()` → `claimInterface()`
+4. **`setupConnection`**: `open()` → `selectConfiguration(1)` → `claimInterface()` → `selectAlternateInterface(0)` → drain IN endpoint
 5. **`sendApdu`**: sends a framed `GET_OS_VERSION` APDU (`0xB001000000`) via `transferOut(3, frame)`
 6. **`receiveResponseFrames`**: reads response frames in a `transferIn(3, 64)` loop
-7. **`closeConnection`**: `releaseInterface()` → `reset()` → `close()`
+7. **`closeConnection`**: `releaseInterface()` → `close()`
+
+**Branch `webusb-fix`** applies three fixes over `main` while keeping the WebUSB API:
+
+- **`reset()` removed** — confirmed crash site on Windows/WinUSB (see `raw-api` branch); triggers re-enumeration and a use-after-free in the native async callback
+- **`selectAlternateInterface(interfaceNumber, 0)`** added after `claimInterface` — sends SET_INTERFACE to reset endpoint data-toggle bits on both host and device; needed because `selectConfiguration(1)` is a no-op on WinUSB when config 1 is already active, leaving device-side toggles out of sync
+- **IN endpoint drain** added before `transferOut` — flushes any spurious frames left by SET_INTERFACE or a previous session; uses a 100 ms timeout on the underlying native `InEndpoint` (which `WebUSBDevice.transferIn` respects, since it wraps the same object)
 
 ## Patch applied
 

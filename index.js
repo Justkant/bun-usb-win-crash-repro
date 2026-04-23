@@ -84,7 +84,8 @@ async function run(native) {
   console.log("\n[2] Setting up connection...");
   if (device.opened) {
     try { await device.releaseInterface(interfaceNumber); } catch { }
-    try { await device.reset(); } catch { }
+    // reset() skipped: on Windows/WinUSB it triggers re-enumeration and crashes
+    // in the native async callback (use-after-free).
     try { await device.close(); } catch { }
   }
   await device.open();
@@ -95,10 +96,39 @@ async function run(native) {
     console.log("  selectConfiguration(1) OK");
   }
 
-  try { await device.reset(); console.log("  reset() OK"); } catch { }
+  // reset() skipped: crash site on Windows/WinUSB (see raw-api branch for details).
 
   await device.claimInterface(interfaceNumber);
   console.log("  claimInterface() OK");
+
+  // selectAlternateInterface sends SET_INTERFACE to the device, which resets endpoint
+  // data-toggle bits on both host and device. This is needed because selectConfiguration
+  // is a no-op when config 1 is already active on WinUSB, leaving device-side toggles
+  // out of sync and causing transferIn to time out on every run after the first.
+  console.log("  calling selectAlternateInterface(0)...");
+  try {
+    await device.selectAlternateInterface(interfaceNumber, 0);
+    console.log("  selectAlternateInterface(0) OK");
+  } catch (e) { console.log(`  selectAlternateInterface(0) error: ${e?.message ?? e}`); }
+
+  // Drain stale frames from the IN endpoint. WebUSB has no per-transfer timeout, but
+  // WebUSBDevice wraps the same native endpoint objects as node-usb, so setting timeout
+  // on the underlying InEndpoint is respected by device.transferIn().
+  const nativeInEp = native.interface(interfaceNumber).endpoints
+    .find(e => (e.address & 0x7f) === ENDPOINT && e.direction === "in");
+  if (nativeInEp) {
+    nativeInEp.timeout = 100;
+    let drained = 0;
+    while (true) {
+      try {
+        const r = await device.transferIn(ENDPOINT, FRAME_SIZE);
+        if (r.status !== "ok") break;
+        drained++;
+      } catch { break; }
+    }
+    nativeInEp.timeout = 3000;
+    if (drained > 0) console.log(`  drained ${drained} stale frame(s) from IN endpoint`);
+  }
 
   // [3] transferOut: send a framed GET_OS_VERSION APDU (0xB001000000)
   // Ledger frame: channel(2) | tag=0x05(1) | seq=0(2) | apduLen(2) | apdu(...)
@@ -114,7 +144,7 @@ async function run(native) {
   const outResult = await device.transferOut(ENDPOINT, frame.buffer);
   console.log(`  transferOut status: ${outResult.status}`);
 
-  // [4] transferIn loop (mirrors receiveResponseFrames — the suspected crash site)
+  // [4] transferIn loop (mirrors receiveResponseFrames)
   console.log("\n[4] Reading response frames via transferIn loop...");
   for (let seq = 0; seq < 5; seq++) {
     const r = await device.transferIn(ENDPOINT, FRAME_SIZE);
@@ -137,6 +167,6 @@ async function run(native) {
   // [5] closeConnection (mirrors NodeWebUsbApduSender.closeConnection)
   console.log("\n[5] Closing connection...");
   try { await device.releaseInterface(interfaceNumber); console.log("  releaseInterface() OK"); } catch { }
-  try { await device.reset(); console.log("  reset() OK"); } catch { }
+  // reset() skipped: crash site on Windows/WinUSB.
   try { await device.close(); console.log("  close() OK"); } catch { }
 }
