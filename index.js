@@ -88,7 +88,6 @@ async function run(device) {
     // already open — close first
     const iface = device.interface(interfaceNumber);
     try { await new Promise((res, rej) => iface.release(true, cb(res, rej))); } catch { }
-    try { await new Promise((res, rej) => device.reset(cb(res, rej))); } catch { }
     try { device.close(); } catch { }
   }
 
@@ -98,11 +97,8 @@ async function run(device) {
   await new Promise((res, rej) => device.setConfiguration(1, cb(res, rej)));
   console.log("  setConfiguration(1) OK");
 
-  try {
-    console.log("  calling reset()...");
-    await new Promise((res, rej) => device.reset(cb(res, rej)));
-    console.log("  reset() OK");
-  } catch (e) { console.log(`  reset() error: ${e?.message ?? e}`); }
+  // reset() skipped: on Windows/WinUSB it triggers re-enumeration and crashes
+  // in the native async callback (use-after-free). Not needed before claimInterface.
 
   const iface = device.interface(interfaceNumber);
   console.log("  calling claimInterface()...");
@@ -159,6 +155,6 @@ async function run(device) {
   // [5] closeConnection
   console.log("\n[5] Closing connection...");
   try { await new Promise((res, rej) => iface.release(true, cb(res, rej))); console.log("  releaseInterface() OK"); } catch { }
-  try { await new Promise((res, rej) => device.reset(cb(res, rej))); console.log("  reset() OK"); } catch { }
+  // reset() skipped: same crash risk as in setup
   try { device.close(); console.log("  close() OK"); } catch { }
 }
