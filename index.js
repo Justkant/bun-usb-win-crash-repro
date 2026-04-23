@@ -1,9 +1,11 @@
 import { usb as usbBindings, getDeviceList, WebUSBDevice } from "usb";
+import { createRequire } from "node:module";
 
 // Must come first on Windows: embed the native addon for Bun standalone binaries
 // (same pattern as wallet-cli embed-usb-native.ts)
 if (process.platform === "win32") {
-  globalThis.__usbNativeAddon = require("./node_modules/usb/prebuilds/win32-x64/node.napi.node");
+  const _require = createRequire(import.meta.url);
+  globalThis.__usbNativeAddon = _require("./node_modules/usb/prebuilds/win32-x64/node.napi.node");
 }
 
 const runtime = typeof Bun !== "undefined" ? `Bun ${Bun.version}` : `Node.js ${process.version}`;
