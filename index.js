@@ -94,26 +94,26 @@ async function run(device) {
   device.open();
   console.log("  open() OK");
 
-  // setConfiguration(0) unconfigures the device so the subsequent setConfiguration(1)
-  // is never a no-op: it always sends SET_CONFIGURATION to the device, which resets
-  // endpoint data-toggle bits on both sides. Without this, WinUSB skips the request
-  // when config 1 is already active and the device-side toggle stays out of sync,
-  // causing transferIn to time out on every run after the first.
-  try {
-    await new Promise((res, rej) => device.setConfiguration(0, cb(res, rej)));
-    console.log("  setConfiguration(0) OK");
-  } catch (e) { console.log(`  setConfiguration(0) error: ${e?.message ?? e}`); }
-
   await new Promise((res, rej) => device.setConfiguration(1, cb(res, rej)));
   console.log("  setConfiguration(1) OK");
 
   // reset() skipped: on Windows/WinUSB it triggers re-enumeration and crashes
   // in the native async callback (use-after-free). Not needed before claimInterface.
+  // setConfiguration(0) also skipped: same re-enumeration problem.
 
   const iface = device.interface(interfaceNumber);
   console.log("  calling claimInterface()...");
   iface.claim();
   console.log("  claimInterface() OK");
+
+  // SET_INTERFACE resets endpoint data-toggle bits on both host and device without
+  // triggering re-enumeration. Needed on WinUSB because setConfiguration(1) is a
+  // no-op when config 1 is already active, leaving device-side toggles out of sync.
+  console.log("  calling setAltSetting(0)...");
+  try {
+    await new Promise((res, rej) => iface.setAltSetting(0, cb(res, rej)));
+    console.log("  setAltSetting(0) OK");
+  } catch (e) { console.log(`  setAltSetting(0) error: ${e?.message ?? e}`); }
 
   // Find OUT and IN endpoints for ENDPOINT number
   const outEp = iface.endpoints.find(e => (e.address & 0x7f) === ENDPOINT && e.direction === "out");
