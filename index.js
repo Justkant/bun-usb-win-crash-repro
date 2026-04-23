@@ -1,131 +1,140 @@
-import { usb, getDeviceList } from "usb";
-import { promisify } from "util";
+import { usb as usbBindings, getDeviceList, WebUSBDevice } from "usb";
+
+// Must come first on Windows: embed the native addon for Bun standalone binaries
+// (same pattern as wallet-cli embed-usb-native.ts)
+if (process.platform === "win32") {
+  globalThis.__usbNativeAddon = require("./node_modules/usb/prebuilds/win32-x64/node.napi.node");
+}
 
 const runtime = typeof Bun !== "undefined" ? `Bun ${Bun.version}` : `Node.js ${process.version}`;
 console.log(`Runtime: ${runtime}`);
 console.log(`Platform: ${process.platform}`);
 
-// Optional VID/PID filter: `node index.js 2c97 0004`
+const LEDGER_VENDOR_ID = 0x2c97;
+const ENDPOINT = 3;
+const FRAME_SIZE = 64;
+
+// VID/PID override: `node index.js 2c97 4011`
 const [, , argVid, argPid] = process.argv;
-const filterVid = argVid ? parseInt(argVid, 16) : null;
+const filterVid = argVid ? parseInt(argVid, 16) : LEDGER_VENDOR_ID;
 const filterPid = argPid ? parseInt(argPid, 16) : null;
 
 function fmt(n) {
   return `0x${n.toString(16).padStart(4, "0")}`;
 }
 
-// --- 1. List all connected USB devices ---
-console.log("\n[1] Listing USB devices...");
-const devices = getDeviceList();
-console.log(`Found ${devices.length} device(s)`);
-for (const d of devices) {
+// --- Hotplug listeners (same as NodeWebUsbTransport.startListeningToConnectionEvents) ---
+usbBindings.on("attach", d => {
   const { idVendor, idProduct } = d.deviceDescriptor;
-  const match = (filterVid === null || filterVid === idVendor) && (filterPid === null || filterPid === idProduct);
-  console.log(`  VID=${fmt(idVendor)} PID=${fmt(idProduct)}${match && (filterVid !== null) ? "  ← target" : ""}`);
-}
-
-// --- 2. Hotplug listener ---
-console.log("\n[2] Starting hotplug listener...");
-usb.on("attach", (d) => {
-  const { idVendor, idProduct } = d.deviceDescriptor;
-  console.log(`  [attach] VID=${fmt(idVendor)} PID=${fmt(idProduct)}`);
+  console.log(`[attach] VID=${fmt(idVendor)} PID=${fmt(idProduct)}`);
 });
-usb.on("detach", (d) => {
+usbBindings.on("detach", d => {
   const { idVendor, idProduct } = d.deviceDescriptor;
-  console.log(`  [detach] VID=${fmt(idVendor)} PID=${fmt(idProduct)}`);
+  console.log(`[detach] VID=${fmt(idVendor)} PID=${fmt(idProduct)}`);
+});
+process.on("exit", () => {
+  usbBindings.removeAllListeners();
+  usbBindings.unrefHotplugEvents();
 });
 
-// --- 3. Find target device ---
-const target = devices.find(({ deviceDescriptor: { idVendor, idProduct } }) =>
-  (filterVid === null || filterVid === idVendor) &&
-  (filterPid === null || filterPid === idProduct)
+// --- Find device ---
+console.log(`\nLooking for VID=${fmt(filterVid)}${filterPid !== null ? ` PID=${fmt(filterPid)}` : ""}...`);
+const natives = getDeviceList().filter(
+  d =>
+    d.deviceDescriptor.idVendor === filterVid &&
+    (filterPid === null || d.deviceDescriptor.idProduct === filterPid),
 );
 
-if (!target) {
-  console.log(filterVid !== null
-    ? `\nNo device found with VID=${fmt(filterVid)}${filterPid !== null ? ` PID=${fmt(filterPid)}` : ""}. Plug one in and retry.`
-    : "\nNo USB devices found."
-  );
-  setTimeout(() => { usb.removeAllListeners(); process.exit(0); }, 3000);
+if (natives.length === 0) {
+  console.log("No matching device found. Connect a Ledger device and retry.");
+  setTimeout(() => { usbBindings.unrefHotplugEvents(); process.exit(0); }, 2000);
 } else {
-  const { idVendor, idProduct } = target.deviceDescriptor;
-  console.log(`\n[3] Opening VID=${fmt(idVendor)} PID=${fmt(idProduct)}...`);
-  await communicate(target);
-  setTimeout(() => { usb.removeAllListeners(); process.exit(0); }, 3000);
+  for (const n of natives) {
+    console.log(`  Found VID=${fmt(n.deviceDescriptor.idVendor)} PID=${fmt(n.deviceDescriptor.idProduct)}`);
+  }
+  await run(natives[0]);
+  process.exit(0);
 }
 
-async function communicate(device) {
-  // Open
-  device.open();
-  console.log("  Opened");
+// Mirrors NodeWebUsbApduSender.setupConnection + sendApdu + receiveResponseFrames + closeConnection
+async function run(native) {
+  // [1] Create WebUSBDevice (same as WebUSBDevice.createInstance in transport)
+  console.log("\n[1] Creating WebUSBDevice instance...");
+  const device = await WebUSBDevice.createInstance(native);
+  console.log(`  VID=${fmt(device.vendorId)} PID=${fmt(device.productId)}`);
 
-  // Control transfer: GET_DESCRIPTOR (Device) — safe read-only operation
-  console.log("  Sending GET_DESCRIPTOR control transfer...");
-  const controlTransfer = promisify(device.controlTransfer.bind(device));
-  try {
-    const descriptor = await controlTransfer(
-      0x80,   // bmRequestType: device-to-host, standard, device
-      0x06,   // bRequest: GET_DESCRIPTOR
-      0x0100, // wValue: Device Descriptor
-      0x0000, // wIndex
-      18      // length: device descriptor is 18 bytes
-    );
-    console.log(`  GET_DESCRIPTOR response (${descriptor.length} bytes): ${descriptor.toString("hex")}`);
-  } catch (err) {
-    console.log(`  GET_DESCRIPTOR failed: ${err.message}`);
-  }
-
-  // Find the first IN endpoint (interrupt or bulk) across all interfaces
-  const iface = findFirstInEndpoint(device);
-  if (iface) {
-    const { interfaceNumber, endpoint } = iface;
-    console.log(`\n[4] Claiming interface ${interfaceNumber}, endpoint 0x${endpoint.address.toString(16)}...`);
-    try {
-      device.interface(interfaceNumber).claim();
-      console.log("  Interface claimed");
-
-      // Async transfer — this is the most likely crash site in Bun on Windows
-      console.log("  Submitting async IN transfer (64 bytes, 1s timeout)...");
-      endpoint.timeout = 1000;
-      const transfer = promisify(endpoint.transfer.bind(endpoint));
-      try {
-        const data = await transfer(64);
-        console.log(`  Transfer received ${data.length} bytes: ${data.toString("hex")}`);
-      } catch (err) {
-        // LIBUSB_TRANSFER_TIMED_OUT is expected if nothing to read — not the bug
-        console.log(`  Transfer result: ${err.message}`);
-      }
-
-      device.interface(interfaceNumber).release(true, (err) => {
-        if (err) console.log(`  Release error: ${err.message}`);
-        else console.log("  Interface released");
-        device.close();
-        console.log("  Closed");
-      });
-    } catch (err) {
-      console.log(`  Could not claim interface: ${err.message}`);
-      device.close();
-      console.log("  Closed");
-    }
-  } else {
-    console.log("\n  No IN endpoint found, skipping transfer step");
-    device.close();
-    console.log("  Closed");
-  }
-}
-
-function findFirstInEndpoint(device) {
-  const config = device.configDescriptor;
-  if (!config) return null;
-  for (const iface of config.interfaces ?? []) {
-    for (const alt of iface) {
-      for (const ep of alt.endpoints ?? []) {
-        // 0x80 bit set = IN direction
-        if (ep.direction === "in") {
-          return { interfaceNumber: alt.interfaceNumber, endpoint: device.interface(alt.interfaceNumber).endpoint(ep.bEndpointAddress) };
-        }
-      }
+  // Find vendor interface (class 0xFF) — same as getVendorInterfaceNumber()
+  const cfg = device.configurations[0];
+  let interfaceNumber = null;
+  for (const iface of cfg?.interfaces ?? []) {
+    if (iface.alternates.some(a => a.interfaceClass === 255)) {
+      interfaceNumber = iface.interfaceNumber;
+      break;
     }
   }
-  return null;
+  if (interfaceNumber === null) {
+    console.log("  No vendor interface (class 0xFF) found on this device");
+    return;
+  }
+  console.log(`  Interface: ${interfaceNumber}`);
+
+  // [2] setupConnection (mirrors NodeWebUsbApduSender.setupConnection)
+  console.log("\n[2] Setting up connection...");
+  if (device.opened) {
+    try { await device.releaseInterface(interfaceNumber); } catch { }
+    try { await device.reset(); } catch { }
+    try { await device.close(); } catch { }
+  }
+  await device.open();
+  console.log("  open() OK");
+
+  if (device.configuration === null) {
+    await device.selectConfiguration(1);
+    console.log("  selectConfiguration(1) OK");
+  }
+
+  try { await device.reset(); console.log("  reset() OK"); } catch { }
+
+  await device.claimInterface(interfaceNumber);
+  console.log("  claimInterface() OK");
+
+  // [3] transferOut: send a framed GET_OS_VERSION APDU (0xB001000000)
+  // Ledger frame: channel(2) | tag=0x05(1) | seq=0(2) | apduLen(2) | apdu(...)
+  console.log("\n[3] Sending GET_OS_VERSION APDU via transferOut...");
+  const apdu = new Uint8Array([0xb0, 0x01, 0x00, 0x00, 0x00]);
+  const frame = new Uint8Array(FRAME_SIZE).fill(0);
+  frame[0] = 0x01; frame[1] = 0x01; // channel
+  frame[2] = 0x05;                   // tag
+  frame[3] = 0x00; frame[4] = 0x00; // sequence
+  frame[5] = 0x00; frame[6] = apdu.length;
+  frame.set(apdu, 7);
+
+  const outResult = await device.transferOut(ENDPOINT, frame.buffer);
+  console.log(`  transferOut status: ${outResult.status}`);
+
+  // [4] transferIn loop (mirrors receiveResponseFrames — the suspected crash site)
+  console.log("\n[4] Reading response frames via transferIn loop...");
+  for (let seq = 0; seq < 5; seq++) {
+    const r = await device.transferIn(ENDPOINT, FRAME_SIZE);
+    const bytes = r.data?.byteLength ?? 0;
+    console.log(`  Frame ${seq}: status=${r.status} bytes=${bytes}`);
+
+    if (r.status !== "ok" || !r.data) break;
+
+    const chunk = new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength);
+    if (seq === 0) {
+      // Parse response length from first frame: channel(2)+tag(1)+seq(2)+len(2)
+      const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      const totalLen = view.getUint16(5);
+      const payload = chunk.slice(7, 7 + Math.min(totalLen, bytes - 7));
+      console.log(`  Response payload (${totalLen} bytes): ${Buffer.from(payload).toString("hex")}`);
+      if (payload.length >= totalLen) break;
+    }
+  }
+
+  // [5] closeConnection (mirrors NodeWebUsbApduSender.closeConnection)
+  console.log("\n[5] Closing connection...");
+  try { await device.releaseInterface(interfaceNumber); console.log("  releaseInterface() OK"); } catch { }
+  try { await device.reset(); console.log("  reset() OK"); } catch { }
+  try { await device.close(); console.log("  close() OK"); } catch { }
 }

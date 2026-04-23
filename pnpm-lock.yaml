@@ -4,13 +4,18 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  usb@2.17.0:
+    hash: 489095f60f30e6127e8077a75f64dc1962a7187d3e054910d61a8a5de45c30a5
+    path: patches/usb@2.17.0.patch
+
 importers:
 
   .:
     dependencies:
       usb:
         specifier: ^2.17.0
-        version: 2.17.0
+        version: 2.17.0(patch_hash=489095f60f30e6127e8077a75f64dc1962a7187d3e054910d61a8a5de45c30a5)
 
 packages:
 
@@ -37,7 +42,7 @@ snapshots:
 
   node-gyp-build@4.8.4: {}
 
-  usb@2.17.0:
+  usb@2.17.0(patch_hash=489095f60f30e6127e8077a75f64dc1962a7187d3e054910d61a8a5de45c30a5):
     dependencies:
       '@types/w3c-web-usb': 1.0.14
       node-addon-api: 8.7.0
