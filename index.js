@@ -99,11 +99,13 @@ async function run(device) {
   console.log("  setConfiguration(1) OK");
 
   try {
+    console.log("  calling reset()...");
     await new Promise((res, rej) => device.reset(cb(res, rej)));
     console.log("  reset() OK");
-  } catch { }
+  } catch (e) { console.log(`  reset() error: ${e?.message ?? e}`); }
 
   const iface = device.interface(interfaceNumber);
+  console.log("  calling claimInterface()...");
   iface.claim();
   console.log("  claimInterface() OK");
 
@@ -129,12 +131,14 @@ async function run(device) {
   frame[5] = 0x00; frame[6] = apdu.length;
   apdu.forEach((b, i) => { frame[7 + i] = b; });
 
+  console.log("  calling transferOut()...");
   await new Promise((res, rej) => outEp.transfer(frame, cb(res, rej)));
   console.log("  transferOut OK");
 
   // [4] transferIn loop
   console.log("\n[4] Reading response frames via transferIn loop...");
   for (let seq = 0; seq < 5; seq++) {
+    console.log(`  calling transferIn(${seq})...`);
     const data = await new Promise((res, rej) =>
       inEp.transfer(FRAME_SIZE, (err, buf) => (err ? rej(err) : res(buf))),
     );
