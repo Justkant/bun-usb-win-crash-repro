@@ -2,21 +2,21 @@
 
 Minimal reproduction for a crash in [Bun](https://bun.sh) when using the [`usb`](https://github.com/node-usb/node-usb) native addon on Windows.
 
-The same script runs fine under Node.js on Windows and under both runtimes on macOS.
-
 Extracted from [wallet-cli](https://github.com/LedgerHQ/ledger-live/tree/develop/apps/wallet-cli) in [ledger-live](https://github.com/LedgerHQ/ledger-live).
+
+**Branch `raw-api`**: uses the raw libusb API (`device.open()`, `iface.claim()`, `endpoint.transfer()`) instead of the WebUSB abstraction layer (`WebUSBDevice`), to isolate whether the crash originates in the WebUSB wrapper or the underlying native bindings.
 
 ## What the script does
 
-Mirrors the wallet-cli USB transport layer (`NodeWebUsbApduSender` + `NodeWebUsbTransport`):
+Same operations as the `main` branch but via raw libusb API:
 
 1. Registers hotplug `attach`/`detach` listeners (calls `unrefHotplugEvents` on exit)
 2. Finds a Ledger device (VID `0x2C97`) via `getDeviceList()`
-3. Creates a `WebUSBDevice` instance and finds the vendor interface (class `0xFF`)
-4. **`setupConnection`**: `open()` → `selectConfiguration(1)` → `reset()` → `claimInterface()`
-5. **`sendApdu`**: sends a framed `GET_OS_VERSION` APDU (`0xB001000000`) via `transferOut(3, frame)`
-6. **`receiveResponseFrames`**: reads response frames in a `transferIn(3, 64)` loop
-7. **`closeConnection`**: `releaseInterface()` → `reset()` → `close()`
+3. Finds the vendor interface (class `0xFF`) from `device.configDescriptor`
+4. **setup**: `device.open()` → `device.setConfiguration(1)` → `device.reset()` → `iface.claim()`
+5. **send**: sends a framed `GET_OS_VERSION` APDU (`0xB001000000`) via `OutEndpoint.transfer(frame)`
+6. **receive**: reads response frames in an `InEndpoint.transfer(64)` loop
+7. **close**: `iface.release()` → `device.reset()` → `device.close()`
 
 ## Patch applied
 
@@ -29,9 +29,15 @@ Mirrors the wallet-cli USB transport layer (`NodeWebUsbApduSender` + `NodeWebUsb
 
 All steps complete (or time out gracefully) on both runtimes.
 
-## Actual behaviour (Windows + Bun)
+## Actual behaviour (Windows + Bun) — `main` branch
 
 Bun crashes — typically a segfault or a hard process exit with no JS-level error — during the `transferIn`/`transferOut` async callbacks or hotplug event handling.
+
+The same crash is reproduced with Node.js on Windows (see `main` branch), confirming the issue is in `node-usb` itself rather than the Bun runtime.
+
+## Purpose of `raw-api` branch
+
+To determine whether the crash is in the WebUSB abstraction layer (`WebUSBDevice`) or in the underlying native bindings. If this branch also crashes, the bug is in the core libusb async callback path; if it does not, the WebUSB wrapper is the culprit.
 
 ## Setup
 

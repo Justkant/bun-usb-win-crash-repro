@@ -1,4 +1,4 @@
-import { usb as usbBindings, getDeviceList, WebUSBDevice } from "usb";
+import { usb as usbBindings, getDeviceList } from "usb";
 import { createRequire } from "node:module";
 
 // Must come first on Windows: embed the native addon for Bun standalone binaries
@@ -25,7 +25,11 @@ function fmt(n) {
   return `0x${n.toString(16).padStart(4, "0")}`;
 }
 
-// --- Hotplug listeners (same as NodeWebUsbTransport.startListeningToConnectionEvents) ---
+function cb(resolve, reject) {
+  return err => (err ? reject(err) : resolve());
+}
+
+// --- Hotplug listeners ---
 usbBindings.on("attach", d => {
   const { idVendor, idProduct } = d.deviceDescriptor;
   console.log(`[attach] VID=${fmt(idVendor)} PID=${fmt(idProduct)}`);
@@ -58,21 +62,19 @@ if (natives.length === 0) {
   process.exit(0);
 }
 
-// Mirrors NodeWebUsbApduSender.setupConnection + sendApdu + receiveResponseFrames + closeConnection
-async function run(native) {
-  // [1] Create WebUSBDevice (same as WebUSBDevice.createInstance in transport)
-  console.log("\n[1] Creating WebUSBDevice instance...");
-  const device = await WebUSBDevice.createInstance(native);
-  console.log(`  VID=${fmt(device.vendorId)} PID=${fmt(device.productId)}`);
-
-  // Find vendor interface (class 0xFF) — same as getVendorInterfaceNumber()
-  const cfg = device.configurations[0];
+async function run(device) {
+  // [1] Find vendor interface (class 0xFF) from raw config descriptor
+  console.log("\n[1] Finding vendor interface...");
+  const config = device.configDescriptor;
   let interfaceNumber = null;
-  for (const iface of cfg?.interfaces ?? []) {
-    if (iface.alternates.some(a => a.interfaceClass === 255)) {
-      interfaceNumber = iface.interfaceNumber;
-      break;
+  for (const alts of config.interfaces) {
+    for (const alt of alts) {
+      if (alt.bInterfaceClass === 255) {
+        interfaceNumber = alt.bInterfaceNumber;
+        break;
+      }
     }
+    if (interfaceNumber !== null) break;
   }
   if (interfaceNumber === null) {
     console.log("  No vendor interface (class 0xFF) found on this device");
@@ -80,63 +82,79 @@ async function run(native) {
   }
   console.log(`  Interface: ${interfaceNumber}`);
 
-  // [2] setupConnection (mirrors NodeWebUsbApduSender.setupConnection)
+  // [2] setupConnection — raw API
   console.log("\n[2] Setting up connection...");
-  if (device.opened) {
-    try { await device.releaseInterface(interfaceNumber); } catch { }
-    try { await device.reset(); } catch { }
-    try { await device.close(); } catch { }
+  if (device.interfaces) {
+    // already open — close first
+    const iface = device.interface(interfaceNumber);
+    try { await new Promise((res, rej) => iface.release(true, cb(res, rej))); } catch { }
+    try { await new Promise((res, rej) => device.reset(cb(res, rej))); } catch { }
+    try { device.close(); } catch { }
   }
-  await device.open();
+
+  device.open();
   console.log("  open() OK");
 
-  if (device.configuration === null) {
-    await device.selectConfiguration(1);
-    console.log("  selectConfiguration(1) OK");
-  }
+  await new Promise((res, rej) => device.setConfiguration(1, cb(res, rej)));
+  console.log("  setConfiguration(1) OK");
 
-  try { await device.reset(); console.log("  reset() OK"); } catch { }
+  try {
+    await new Promise((res, rej) => device.reset(cb(res, rej)));
+    console.log("  reset() OK");
+  } catch { }
 
-  await device.claimInterface(interfaceNumber);
+  const iface = device.interface(interfaceNumber);
+  iface.claim();
   console.log("  claimInterface() OK");
+
+  // Find OUT and IN endpoints for ENDPOINT number
+  const outEp = iface.endpoints.find(e => (e.address & 0x7f) === ENDPOINT && e.direction === "out");
+  const inEp = iface.endpoints.find(e => (e.address & 0x7f) === ENDPOINT && e.direction === "in");
+  if (!outEp || !inEp) {
+    console.log(`  Endpoints for number ${ENDPOINT} not found on interface ${interfaceNumber}`);
+    console.log(`  Available: ${iface.endpoints.map(e => `0x${e.address.toString(16)}(${e.direction})`).join(", ")}`);
+    iface.release(() => { try { device.close(); } catch { } });
+    return;
+  }
+  console.log(`  OUT ep: 0x${outEp.address.toString(16)}  IN ep: 0x${inEp.address.toString(16)}`);
 
   // [3] transferOut: send a framed GET_OS_VERSION APDU (0xB001000000)
   // Ledger frame: channel(2) | tag=0x05(1) | seq=0(2) | apduLen(2) | apdu(...)
   console.log("\n[3] Sending GET_OS_VERSION APDU via transferOut...");
   const apdu = new Uint8Array([0xb0, 0x01, 0x00, 0x00, 0x00]);
-  const frame = new Uint8Array(FRAME_SIZE).fill(0);
+  const frame = Buffer.alloc(FRAME_SIZE, 0);
   frame[0] = 0x01; frame[1] = 0x01; // channel
   frame[2] = 0x05;                   // tag
   frame[3] = 0x00; frame[4] = 0x00; // sequence
   frame[5] = 0x00; frame[6] = apdu.length;
-  frame.set(apdu, 7);
+  apdu.forEach((b, i) => { frame[7 + i] = b; });
 
-  const outResult = await device.transferOut(ENDPOINT, frame.buffer);
-  console.log(`  transferOut status: ${outResult.status}`);
+  await new Promise((res, rej) => outEp.transfer(frame, cb(res, rej)));
+  console.log("  transferOut OK");
 
-  // [4] transferIn loop (mirrors receiveResponseFrames — the suspected crash site)
+  // [4] transferIn loop
   console.log("\n[4] Reading response frames via transferIn loop...");
   for (let seq = 0; seq < 5; seq++) {
-    const r = await device.transferIn(ENDPOINT, FRAME_SIZE);
-    const bytes = r.data?.byteLength ?? 0;
-    console.log(`  Frame ${seq}: status=${r.status} bytes=${bytes}`);
+    const data = await new Promise((res, rej) =>
+      inEp.transfer(FRAME_SIZE, (err, buf) => (err ? rej(err) : res(buf))),
+    );
+    const bytes = data?.byteLength ?? 0;
+    console.log(`  Frame ${seq}: bytes=${bytes}`);
 
-    if (r.status !== "ok" || !r.data) break;
+    if (!data || bytes === 0) break;
 
-    const chunk = new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength);
     if (seq === 0) {
-      // Parse response length from first frame: channel(2)+tag(1)+seq(2)+len(2)
-      const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const totalLen = view.getUint16(5);
-      const payload = chunk.slice(7, 7 + Math.min(totalLen, bytes - 7));
-      console.log(`  Response payload (${totalLen} bytes): ${Buffer.from(payload).toString("hex")}`);
+      const payload = data.slice(7, 7 + Math.min(totalLen, bytes - 7));
+      console.log(`  Response payload (${totalLen} bytes): ${payload.toString("hex")}`);
       if (payload.length >= totalLen) break;
     }
   }
 
-  // [5] closeConnection (mirrors NodeWebUsbApduSender.closeConnection)
+  // [5] closeConnection
   console.log("\n[5] Closing connection...");
-  try { await device.releaseInterface(interfaceNumber); console.log("  releaseInterface() OK"); } catch { }
-  try { await device.reset(); console.log("  reset() OK"); } catch { }
-  try { await device.close(); console.log("  close() OK"); } catch { }
+  try { await new Promise((res, rej) => iface.release(true, cb(res, rej))); console.log("  releaseInterface() OK"); } catch { }
+  try { await new Promise((res, rej) => device.reset(cb(res, rej))); console.log("  reset() OK"); } catch { }
+  try { device.close(); console.log("  close() OK"); } catch { }
 }
